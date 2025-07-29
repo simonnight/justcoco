@@ -1,158 +1,318 @@
-# 5_review_tool.py (UI 調整版)
-# 职责：一个可视化审核工具，用于高效地对AI的编码结果进行人工审核和修正。
+# 5_review_tool.py
+# 权威最终版: 实现了以“统一审核库”为核心的全新工作流，并整合所有高级交互功能。
 
 import streamlit as st
 import pandas as pd
 import os
+import json
+import glob
 
-# --- 配置 ---
-# 自动生成的、需要审核的聚合格式报告
-CODED_FILE_TO_REVIEW = "06_final_reports/Final_Coded_Report_AGGREGATED.csv" 
-# 您的原始码表，用于搜索和选择
-CODEBOOK_FILE = "01_source_data/last_phase_codebook.csv"
-# 保存修正结果的文件（增量写入）
-CORRECTED_FILE = "06_final_reports/Final_Coded_Report_CORRECTED.csv"
+# --- 页面配置 (必须是第一个st命令) ---
+st.set_page_config(layout="wide")
 
-# --- 页面初始化 ---
-st.set_page_config(layout="wide", page_title="AI 编码审核", page_icon="🔍") # 調整頁面佈局和標題、圖標
-st.title("AI 编码结果审核平台 v2.0")
-st.info("说明：在此界面中确认或修改AI的编码结果。每次点击“确认”都会将修正后的数据增量保存，进度不会丢失。")
+# --- 核心配置 ---
+RESULTS_FOLDER = "05_coded_results"
+REVIEWED_FOLDER = "06_reviewed_results"
+if not os.path.exists(REVIEWED_FOLDER):
+    os.makedirs(REVIEWED_FOLDER)
+CODEBOOK_FOLDER = "01_source_data"
+BASE_CODEBOOK_FILE = os.path.join(CODEBOOK_FOLDER, "last_phase_codebook.csv")
+# 【新增核心】实时增长的新码表文件
+NEWLY_ADDED_CODES_FILE = os.path.join(CODEBOOK_FOLDER, "newly_added_codes.csv")
+# 【新增核心】统一的、持久化的审核总库
+MASTER_REVIEW_FILE = os.path.join(REVIEWED_FOLDER, "master_review_library.csv")
 
-# --- 数据加载与缓存 ---
+# ==============================================================================
+# --- 辅助函数定义区 ---
+# ==============================================================================
+
 @st.cache_data
-def load_codebook():
-    """加载码表"""
+def load_codebooks():
+    """加载并合并基础码表和新增码表"""
     try:
-        codebook_df = pd.read_csv(CODEBOOK_FILE, dtype={'code': str})
-        codebook_df['display'] = (
-            codebook_df['code'] + " - [" +
-            codebook_df['net'].fillna('') + "/" +
-            codebook_df['subnet'].fillna('') + "] " +
-            codebook_df['label'].fillna('')
-        )
-        return codebook_df
+        base_df = pd.read_csv(BASE_CODEBOOK_FILE, dtype=str).fillna('')
     except FileNotFoundError:
-        st.error(f"错误：找不到码表文件 {CODEBOOK_FILE}。请检查文件路径。")
+        st.error(f"错误：找不到基础码表文件 {BASE_CODEBOOK_FILE}。")
         return None
 
-codebook_df = load_codebook()
-
-if codebook_df is None:
-    st.stop()
-
-# --- 数据加载逻辑 ---
-try:
-    coded_df = pd.read_csv(CODED_FILE_TO_REVIEW)
-except FileNotFoundError:
-    st.error(f"错误：找不到待审核的报告 {CODED_FILE_TO_REVIEW}。请先运行 `6_convert_and_merge_results.py` 生成聚合报告。")
-    st.stop()
-
-if os.path.exists(CORRECTED_FILE):
-    corrected_df = pd.read_csv(CORRECTED_FILE, dtype=str)
-    if 'uuid' in coded_df.columns and 'uuid' in corrected_df.columns:
-        # 篩選出未審核的數據
-        uncorrected_df = coded_df[~coded_df['uuid'].isin(corrected_df['uuid'])].reset_index(drop=True)
-    else:
-        st.error("错误：待审核文件或已修正文件中缺少 'uuid' 列，无法进行进度管理。请确保所有相关文件包含 'uuid'。")
-        uncorrected_df = pd.DataFrame() # 创建一个空的DataFrame以避免後續錯誤
-else:
-    corrected_df = pd.DataFrame()
-    uncorrected_df = coded_df
-
-# 使用session state来跟踪当前审核的索引
-if 'current_index' not in st.session_state:
-    st.session_state.current_index = 0
-
-total_count = len(coded_df)
-corrected_count = len(corrected_df)
-
-# --- UI 調整範例 ---
-
-# 進度條和狀態顯示
-st.markdown("---") # 添加分隔線
-st.markdown(f"<h3 style='text-align: center; color: #4CAF50;'>审核概覽</h3>", unsafe_allow_html=True) # 居中標題
-st.progress((corrected_count / total_count) if total_count > 0 else 0, text=f"**当前进度**: {corrected_count} / {total_count} (剩余: {len(uncorrected_df)})")
-st.markdown("---") # 添加分隔線
-
-# 審核界面的主要佈局
-index = st.session_state.current_index
-if index < len(uncorrected_df):
-    current_row = uncorrected_df.iloc[index]
-    
-    # 使用 col_weights 調整列寬，例如：問題和回答佔大頭，AI處理方式佔小頭
-    col1, col2 = st.columns([2, 1]) # 調整列寬比例，第一列是第二列的兩倍寬
-    
-    with col1:
-        st.subheader("原文信息") # 添加小標題
-        st.markdown(f"**問題**: <span style='font-size:1.1em; color:#3366FF;'>{current_row.get('question', 'N/A')}</span>", unsafe_allow_html=True)
-        st.markdown(f"**回答原文**: <span style='font-size:1.2em; font-weight:bold;'>{current_row.get('text', 'N/A')}</span>", unsafe_allow_html=True)
-        
-        # 使用 st.expander 組織信息，讓界面更整潔
-        with st.expander("查看原始數據細節"):
-            st.json(current_row.to_dict()) # 顯示所有原始行數據
-
-    with col2:
-        st.subheader("AI 处理详情") # 添加小標題
-        st.markdown(f"**AI處理方式**: <span style='color:#FF9900;'>{current_row.get('process_method', 'N/A')}</span>", unsafe_allow_html=True)
-        st.code(f"UUID: {current_row.get('uuid', 'N/A')}")
-        
-        # 可以添加一些 AI 相關的指標，例如置信度（如果您的數據包含）
-        # st.metric(label="AI 置信度", value=f"{current_row.get('ai_confidence', 'N/A')}%")
-
-    st.markdown("---") # 再次分隔
-
-    # 編碼選擇部分
-    st.markdown("<h4 style='color: #00796B;'>請確認或修正編碼</h4>", unsafe_allow_html=True)
-    ai_codes_str = str(current_row.get('code_agg', ''))
-    ai_codes = ai_codes_str.split('; ') if ai_codes_str and ai_codes_str != 'nan' else []
-    
-    selected_options = st.multiselect(
-        "搜索並選擇編碼 (可在此框中輸入 `code` 或 `关键词` 进行搜索):",
-        options=codebook_df['display'],
-        default=[d for d in codebook_df['display'] if d.split(' - ')[0] in ai_codes],
-        placeholder="選擇或搜索編碼..." # 添加占位符文本
-    )
-    
-    # 添加一個小間距
-    st.write("") 
-
-    # 確認按鈕
-    if st.button("✅ 確認 & 保存 & 下一條", use_container_width=True, type="primary"):
-        selected_codes_full_info = codebook_df[codebook_df['display'].isin(selected_options)]
-        
-        # 準備要保存的、經過修正的數據行
-        corrected_data = current_row.to_dict()
-        
-        # 確保正確更新聚合列
-        for col in ['sentiment', 'net', 'subnet', 'code', 'label']:
-            # 只有當選中的編碼信息中包含該列時才嘗試聚合
-            if col in selected_codes_full_info.columns: 
-                 corrected_data[f'{col}_agg'] = "; ".join(selected_codes_full_info[col].astype(str).dropna().tolist())
+    if os.path.exists(NEWLY_ADDED_CODES_FILE):
+        try:
+            new_df = pd.read_csv(NEWLY_ADDED_CODES_FILE, dtype=str).fillna('')
+            if not new_df.empty:
+                for col in base_df.columns:
+                    if col not in new_df.columns:
+                        new_df[col] = ''
+                new_df = new_df[list(base_df.columns)]
+                combined_df = pd.concat([base_df, new_df], ignore_index=True)
             else:
-                # 如果該列不在selected_codes_full_info中，但corrected_data中存在其_agg，則清空
-                if f'{col}_agg' in corrected_data:
-                    corrected_data[f'{col}_agg'] = ""
+                combined_df = base_df
+        except pd.errors.EmptyDataError:
+             combined_df = base_df
+    else:
+        combined_df = base_df
         
-        # 確保is_new_suggestion_agg列存在
-        if 'is_new_suggestion_agg' not in corrected_data:
-            corrected_data['is_new_suggestion_agg'] = ''
+    combined_df.drop_duplicates(subset=['code'], keep='last', inplace=True)
+    
+    required_cols = ['code', 'net', 'subnet', 'label', 'sentiment']
+    for col in required_cols:
+        if col not in combined_df.columns:
+            st.error(f"错误：合并后的码表中缺少必需的列: '{col}'。")
+            return None
+    
+    return combined_df
 
-        temp_df = pd.DataFrame([corrected_data])
+@st.cache_resource
+def load_master_review_file():
+    """加载总审核库文件"""
+    if os.path.exists(MASTER_REVIEW_FILE):
+        return pd.read_csv(MASTER_REVIEW_FILE, dtype=str).fillna('')
+    return pd.DataFrame(columns=['uuid', 'question', 'text', 'review_status', 'coding_results_json'])
+
+def save_master_review_file(df):
+    """保存总审核库文件"""
+    df.to_csv(MASTER_REVIEW_FILE, index=False, encoding='utf-8-sig')
+    st.cache_resource.clear() # 清空缓存以便下次能读取到最新版
+
+def update_record_in_library(uuid, question, text, review_status, coding_results):
+    """在总审核库中新增或更新一条记录"""
+    df = load_master_review_file()
+    
+    coding_results_str = json.dumps(coding_results, ensure_ascii=False)
+    
+    new_record = {
+        'uuid': uuid, 'question': question, 'text': text,
+        'review_status': review_status, 'coding_results_json': coding_results_str
+    }
+    
+    # 如果已存在，直接更新；否则追加
+    if uuid in df['uuid'].values:
+        df.loc[df['uuid'] == uuid, list(new_record.keys())] = list(new_record.values())
+    else:
+        df = pd.concat([df, pd.DataFrame([new_record])], ignore_index=True)
         
-        if not os.path.exists(CORRECTED_FILE):
-            temp_df.to_csv(CORRECTED_FILE, index=False, encoding='utf-8-sig')
+    save_master_review_file(df)
+    
+    if review_status == "已审核":
+        update_newly_added_codes(coding_results)
+
+def update_newly_added_codes(coding_results):
+    """实时更新新码表文件"""
+    codebook_df = load_codebooks()
+    if codebook_df is None: return
+
+    new_codes_to_add = []
+    for item in coding_results:
+        code_val = str(item.get('code', ''))
+        if code_val and code_val not in codebook_df['code'].tolist():
+            # 确保新编码有所有必要的列
+            new_item = {
+                'sentiment': item.get('sentiment', ''), 'net': item.get('net', ''),
+                'subnet': item.get('subnet', ''), 'code': item.get('code', ''),
+                'label': item.get('label', '')
+            }
+            new_codes_to_add.append(new_item)
+    
+    if new_codes_to_add:
+        new_df = pd.DataFrame(new_codes_to_add)
+        header = not os.path.exists(NEWLY_ADDED_CODES_FILE)
+        new_df.to_csv(NEWLY_ADDED_CODES_FILE, mode='a', index=False, header=header, encoding='utf-8-sig')
+        st.cache_data.clear()
+        st.toast("新编码已学习并添加到实时码表！", icon="🧠")
+
+# ==============================================================================
+# --- 页面渲染函数 ---
+# ==============================================================================
+
+def render_selection_page(master_df):
+    """渲染第一页：文件选择与总库管理"""
+    st.title("AI编码结果质控与交付管理平台")
+    
+    if st.button("🔄 刷新 / 导入新批次", use_container_width=True, type="primary"):
+        all_jsonl_files = glob.glob(os.path.join(RESULTS_FOLDER, "**", "*.jsonl"), recursive=True)
+        new_records = []
+        existing_uuids = set(master_df['uuid'])
+        
+        for f in all_jsonl_files:
+            with open(f, 'r', encoding='utf-8') as jf:
+                for line in jf:
+                    try:
+                        record = json.loads(line)
+                        if record.get('uuid') not in existing_uuids:
+                            new_records.append({
+                                'uuid': record.get('uuid'), 'question': record.get('question'),
+                                'text': record.get('text'), 'review_status': '待审核',
+                                'coding_results_json': json.dumps(record.get('coding_results', []), ensure_ascii=False)
+                            })
+                            existing_uuids.add(record.get('uuid'))
+                    except:
+                        continue
+        
+        if new_records:
+            new_df = pd.DataFrame(new_records)
+            updated_df = pd.concat([master_df, new_df], ignore_index=True)
+            save_master_review_file(updated_df)
+            st.success(f"成功导入 {len(new_records)} 条新纪录！")
+            st.rerun()
         else:
-            temp_df.to_csv(CORRECTED_FILE, mode='a', header=False, index=False, encoding='utf-8-sig')
-        
-        st.toast(f"记录 {current_row.get('uuid', '')} 已保存！", icon="🎉")
-        
-        # 在保存後，更新索引並重新運行，確保顯示下一條
-        st.session_state.current_index += 1
+            st.info("没有发现新的AI编码结果可供导入。")
+
+    st.divider()
+
+    unreviewed_df = master_df[master_df['review_status'] == '待审核']
+    reviewed_df = master_df[master_df['review_status'] == '已审核']
+    
+    st.header("1. 待审核库")
+    st.markdown(f"当前共有 **{len(unreviewed_df)}** 条记录等待审核。")
+    if st.button("进入待审核库", disabled=unreviewed_df.empty):
+        st.session_state.page = "review"
+        st.session_state.review_mode = "unreviewed"
+        st.session_state.current_index = 0
         st.rerun()
 
-else:
-    # 所有數據審核完畢的界面
-    st.balloons() # 放氣球慶祝
-    st.success("🎉 恭喜！所有数据都已审核完毕！")
-    st.markdown(f"最终的修正文件已保存为: **{CORRECTED_FILE}**")
+    st.header("2. 已审核库")
+    st.markdown(f"当前共有 **{len(reviewed_df)}** 条记录已完成审核。")
+    if st.button("进入已审核库 (可重新编辑)", disabled=reviewed_df.empty):
+        st.session_state.page = "review"
+        st.session_state.review_mode = "reviewed"
+        st.session_state.current_index = 0
+        st.rerun()
 
+def render_review_page(codebook_df, master_df):
+    """渲染第二页：审核工作区"""
+    
+    review_mode = st.session_state.review_mode
+    if review_mode == "unreviewed":
+        df_to_review = master_df[master_df['review_status'] == '待审核'].copy()
+        df_to_review.sort_values(by='text', inplace=True)
+        df_to_review.reset_index(drop=True, inplace=True)
+    else:
+        df_to_review = master_df[master_df['review_status'] == '已审核'].copy().reset_index(drop=True)
+
+    if df_to_review.empty:
+        st.warning(f"“{review_mode}”库中没有记录。")
+        if st.button("<< 返回首页"): st.session_state.page = "selection"; st.rerun()
+        st.stop()
+    
+    if 'current_index' not in st.session_state or st.session_state.current_index >= len(df_to_review):
+        st.session_state.current_index = 0
+
+    current_row_data = df_to_review.loc[st.session_state.current_index]
+    if 'current_codes' not in st.session_state or st.session_state.get('current_uuid') != current_row_data['uuid']:
+        st.session_state.current_uuid = current_row_data.get('uuid')
+        st.session_state.current_codes = json.loads(current_row_data.get('coding_results_json', '[]'))
+        st.session_state.original_codes = list(st.session_state.current_codes)
+    
+    def save_changes(status):
+        update_record_in_library(
+            st.session_state.current_uuid, current_row_data['question'],
+            current_row_data['text'], status, st.session_state.current_codes
+        )
+        st.session_state.last_saved_codes = list(st.session_state.current_codes)
+        
+    def go_to_next():
+        save_changes(status="待审核")
+        if st.session_state.current_index < len(df_to_review) - 1:
+            st.session_state.current_index += 1
+        st.session_state.current_uuid = None
+            
+    def go_to_prev():
+        save_changes(status="待审核")
+        if st.session_state.current_index > 0:
+            st.session_state.current_index -= 1
+        st.session_state.current_uuid = None
+            
+    def confirm_changes():
+        save_changes(status="已审核")
+        st.toast("本条已确认！", icon="✅")
+    
+    def copy_previous():
+        if 'last_saved_codes' in st.session_state and st.session_state.last_saved_codes is not None:
+            st.session_state.current_codes = [dict(item) for item in st.session_state.last_saved_codes]
+        else:
+            st.warning("没有上一条已保存的编码可供复制。")
+
+    def revert_changes(): st.session_state.current_codes = [dict(item) for item in st.session_state.original_codes]
+    def add_new_code(): st.session_state.current_codes.append({'sentiment':'', 'net':'', 'subnet':'', 'code':'', 'label':''})
+    def delete_code(index_to_delete): st.session_state.current_codes.pop(index_to_delete)
+    def exit_to_selection():
+        st.session_state.page = "selection"
+        for key in ['current_codes', 'current_uuid', 'current_index', 'review_mode', 'last_saved_codes']:
+            if key in st.session_state: del st.session_state[key]
+    
+    mg_cols = st.columns([2, 1.5, 1.5, 1, 1.5, 1, 2])
+    if mg_cols[0].button("<< 返回首页"): exit_to_selection(); st.rerun()
+    mg_cols[1].button("< 上一条", on_click=go_to_prev, disabled=(st.session_state.current_index == 0))
+    mg_cols[2].button("📝 复制上一条", on_click=copy_previous, disabled=('last_saved_codes' not in st.session_state or st.session_state.last_saved_codes is None))
+    mg_cols[3].button("💾 仅保存", on_click=lambda: save_changes(status="待审核"))
+    mg_cols[4].button("🔄 撤销修改", on_click=revert_changes)
+    mg_cols[5].button("✅ 确认", on_click=confirm_changes, type="primary")
+    mg_cols[6].button("下一条 >", on_click=go_to_next, use_container_width=True, disabled=(st.session_state.current_index >= len(df_to_review) - 1))
+
+    st.markdown(f"**当前库**: `{review_mode}` | **进度**: {st.session_state.current_index + 1} / {len(df_to_review)}")
+    st.divider()
+    
+    info_cols = st.columns(2)
+    info_cols[0].markdown(f"**问题**:"); info_cols[0].info(current_row_data.get('question', 'N/A'))
+    info_cols[1].markdown(f"**回答原文**:"); info_cols[1].success(current_row_data.get('text', 'N/A'))
+    
+    st.divider()
+    st.subheader("编码结果与修正")
+    
+    if 'current_codes' in st.session_state:
+        header_cols = st.columns([2, 2, 3, 3, 4, 1])
+        header_cols[0].markdown("**Code**"); header_cols[1].markdown("**Sentiment**"); header_cols[2].markdown("**Net**")
+        header_cols[3].markdown("**Subnet**"); header_cols[4].markdown("**Label**")
+
+        for i, code_item in enumerate(st.session_state.current_codes):
+            row_cols = st.columns([2, 2, 3, 3, 4, 1])
+            
+            def get_options_and_index(column_name, current_value, df_filter=None):
+                if df_filter is None: df_filter = codebook_df
+                options = [''] + sorted(df_filter[column_name].unique().tolist())
+                if current_value and current_value not in options:
+                    options.insert(1, current_value)
+                return options, options.index(current_value) if current_value in options else 0
+
+            with row_cols[0]:
+                code_options, code_index = get_options_and_index('code', str(code_item.get('code', '')))
+                st.session_state.current_codes[i]['code'] = st.selectbox("Code", code_options, key=f"code_{i}", label_visibility="collapsed", index=code_index)
+            with row_cols[1]:
+                s_options, s_index = get_options_and_index('sentiment', code_item.get('sentiment', ''))
+                st.session_state.current_codes[i]['sentiment'] = st.selectbox("Sentiment", s_options, key=f"sentiment_{i}", label_visibility="collapsed", index=s_index)
+            with row_cols[2]:
+                n_options, n_index = get_options_and_index('net', code_item.get('net', ''))
+                st.session_state.current_codes[i]['net'] = st.selectbox("Net", n_options, key=f"net_{i}", label_visibility="collapsed", index=n_index)
+            with row_cols[3]:
+                sn_options, sn_index = get_options_and_index('subnet', code_item.get('subnet', ''))
+                st.session_state.current_codes[i]['subnet'] = st.selectbox("Subnet", sn_options, key=f"subnet_{i}", label_visibility="collapsed", index=sn_index)
+            with row_cols[4]:
+                l_options, l_index = get_options_and_index('label', code_item.get('label', ''))
+                st.session_state.current_codes[i]['label'] = st.selectbox("Label", l_options, key=f"label_{i}", label_visibility="collapsed", index=l_index)
+
+            with row_cols[5]:
+                st.button("❌", key=f"delete_{i}", on_click=delete_code, args=(i,))
+        
+        st.markdown(f"---"); st.button("+ 添加新编码", on_click=add_new_code, use_container_width=True)
+
+# ==============================================================================
+# --- 主程序入口 ---
+# ==============================================================================
+def main():
+    st.markdown("""<style>html, body, [class*="st-"], .st-emotion-cache-16txtl3 {font-size: 0.85rem;}</style>""", unsafe_allow_html=True)
+
+    if 'page' not in st.session_state:
+        st.session_state.page = 'selection'
+
+    master_df = load_master_review_file()
+    codebook_df = load_codebooks()
+
+    if codebook_df is None:
+        st.stop()
+
+    if st.session_state.page == 'selection':
+        render_selection_page(master_df)
+    elif st.session_state.page == 'review':
+        render_review_page(codebook_df, master_df)
+
+if __name__ == "__main__":
+    main()
